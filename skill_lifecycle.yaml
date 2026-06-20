@@ -1,0 +1,41 @@
+name: gemini-tts-srt
+status: draft
+owner: "Openclaw-Metis"
+archetype: executor
+primary_structure_pattern: pipeline
+lifecycle:
+  created_at: 2026-06-20
+  last_validated_at: 2026-06-20
+  last_released_at: null
+  review_interval_days: 60
+  next_review_due: 2026-08-19
+support:
+  primary_hosts:
+    - agent-skills
+  secondary_hosts: []
+  unsupported_hosts: []
+risk:
+  external_side_effects: true
+  requires_secrets: true
+  data_sensitivity: low
+dependencies:
+  scripts:
+    - scripts/gemini_tts.py
+  references:
+    - references/readiness_report.md
+    - references/prompting.md
+    - references/srt-strategy.md
+stewardship:
+  reviewers: []
+  stale_after_days: 120
+  escalation:
+    stale: needs-maintenance
+    no_owner: orphaned
+portfolio:
+  overlaps_with: []
+  hands_off_to: ["media-downloader"]
+  depends_on: []
+  supersedes: []
+  incorporates: ["tts-prompter (prompting framework)"]
+  deprecated_by: null
+  shares_tool_contract_with: []

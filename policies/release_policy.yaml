@@ -1,0 +1,12 @@
+release_policy:
+  required_checks:
+    - format
+    - structure
+    - workflow_contract
+    - lifecycle
+    - lifecycle_state
+    - eval_coverage
+  block_if:
+    - has_todo
+    - missing_owner
+    - stale_audit

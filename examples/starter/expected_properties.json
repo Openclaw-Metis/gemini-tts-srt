@@ -1,0 +1,10 @@
+{{
+  "must_include_sections": [
+    "[TODO: section]"
+  ],
+  "must_not_include": [
+    "TODO",
+    "待補"
+  ],
+  "minimum_use_cases": 0
+}}

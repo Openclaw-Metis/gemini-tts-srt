@@ -1,0 +1,6 @@
+retirement_policy:
+  minimum_deprecation_days: 90
+  required_before_retirement:
+    - replacement_released
+    - migration_guide_exists
+    - no_internal_references

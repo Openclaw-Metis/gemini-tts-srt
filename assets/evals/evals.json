@@ -1,0 +1,159 @@
+{
+  "skill_name": "gemini-tts-srt",
+  "benchmark_metadata_required": [
+    "skill_version",
+    "git_commit",
+    "host",
+    "model",
+    "temperature",
+    "run_timestamp",
+    "grader_version"
+  ],
+  "evals": [
+    {
+      "id": 1,
+      "name": "zh-direct-voiceover-srt",
+      "type": "functional",
+      "language": "zh",
+      "trigger_class": "direct",
+      "coverage_tags": [
+        "should-trigger",
+        "happy-path"
+      ],
+      "prompt": "用 Gemini 幫這段旁白配音，台灣口音女聲，順便給我 srt：上古時代，有一位令天地變色的戰神蚩尤。他銅頭鐵額，刀槍不入，還能呼風喚霧。",
+      "expected_output": "呼叫 scripts/gemini_tts.py 產出一個音檔與一個 .srt，cue 數等於字幕行數，並回報路徑與秒數。",
+      "files": [],
+      "expectations": [
+        "選擇 gemini-tts-srt 而非 tts-prompter",
+        "風格指令使用英文，voice 為 30 個 prebuilt voices 之一",
+        "輸出含 .srt 且其 cue 數等於切出的行數",
+        "人名『蚩尤』不被切斷在兩行"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "en-indirect-narration-subtitles",
+      "type": "trigger",
+      "language": "en",
+      "trigger_class": "indirect",
+      "coverage_tags": [
+        "should-trigger"
+      ],
+      "prompt": "I have a voiceover script. Generate narration with subtitles using Gemini text-to-speech and give me an SRT.",
+      "expected_output": "路由到 gemini-tts-srt，使用 segmented 模式產出音檔與 SRT。",
+      "files": [],
+      "expectations": [
+        "辨識為 Gemini TTS 配音 + 字幕任務",
+        "不誤路由到 media-downloader 或 tts-prompter"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "zh-estimate-no-key",
+      "type": "functional",
+      "language": "zh",
+      "trigger_class": "indirect",
+      "coverage_tags": [
+        "should-trigger",
+        "edge-case"
+      ],
+      "prompt": "我還沒有 Gemini 金鑰，先幫我看這段配出來字幕怎麼斷、大概幾秒：靜夜思，床前明月光，疑是地上霜。",
+      "expected_output": "使用 --estimate 在無金鑰下產出 .srt 與 report.json，並說明為預估值。",
+      "files": [],
+      "expectations": [
+        "不因缺金鑰而失敗，改用 --estimate",
+        "明確說明時長為語速表預估、實際以合成後實測為準"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "zh-negative-prompt-only",
+      "type": "trigger",
+      "language": "zh",
+      "trigger_class": "negative",
+      "coverage_tags": [
+        "should-not-trigger",
+        "near-miss",
+        "overlap-neighbor"
+      ],
+      "prompt": "幫我寫一段 Gemini TTS 的風格提示詞就好，我自己會去生成。",
+      "expected_output": "不啟用本技能；交給 tts-prompter（純提示詞設計）。",
+      "files": [],
+      "expectations": [
+        "不呼叫 gemini_tts.py",
+        "辨識為提示詞設計任務並指向 tts-prompter"
+      ]
+    },
+    {
+      "id": 5,
+      "name": "en-negative-download-asset",
+      "type": "trigger",
+      "language": "en",
+      "trigger_class": "negative",
+      "coverage_tags": [
+        "should-not-trigger",
+        "near-miss"
+      ],
+      "prompt": "Find and download a 15-second ocean waves stock video for my project.",
+      "expected_output": "不啟用本技能；交給 media-downloader。",
+      "files": [],
+      "expectations": [
+        "辨識為素材下載任務，不路由到 gemini-tts-srt"
+      ]
+    },
+    {
+      "id": 6,
+      "name": "mixed-negative-non-gemini-engine",
+      "type": "trigger",
+      "language": "mixed",
+      "trigger_class": "negative",
+      "coverage_tags": [
+        "should-not-trigger",
+        "near-miss",
+        "overlap-neighbor"
+      ],
+      "prompt": "我有一段產品介紹的旁白稿，想用 Edge TTS（不是 Gemini）把它配成語音，並且同時輸出一份 SRT 字幕檔放進影片，可以幫我用 Edge TTS 處理嗎？",
+      "expected_output": "本技能僅支援 Gemini；指定 Edge TTS 時不啟用，說明引擎不符。",
+      "files": [],
+      "expectations": [
+        "辨識引擎為 Edge TTS（非 Gemini），不誤用本技能"
+      ]
+    },
+    {
+      "id": 7,
+      "name": "mixed-failure-model-404",
+      "type": "functional",
+      "language": "mixed",
+      "trigger_class": "direct",
+      "coverage_tags": [
+        "failure-mode",
+        "should-trigger"
+      ],
+      "prompt": "用 gemini-3.1-flash-tts-preview 配音這段：Hello world. 結果回 404 model not found，怎麼辦？",
+      "expected_output": "辨識為模型不可用，建議改 --model gemini-2.5-flash-preview-tts 重試。",
+      "files": [],
+      "expectations": [
+        "停止並回報 404 原因",
+        "建議切換到官方文件列出的 2.5 TTS 模型"
+      ]
+    },
+    {
+      "id": 8,
+      "name": "zh-edge-case-long-script-cost",
+      "type": "trigger",
+      "language": "zh",
+      "trigger_class": "direct",
+      "coverage_tags": [
+        "edge-case",
+        "should-trigger"
+      ],
+      "prompt": "這份 5000 字的稿全部用 Gemini 配音並產字幕。",
+      "expected_output": "先估 segmented 模式的呼叫次數與時長，告知成本並請使用者確認後再執行。",
+      "files": [],
+      "expectations": [
+        "對長腳本先用 --estimate 預估行數/呼叫數",
+        "在大量 API 呼叫前先請使用者確認"
+      ]
+    }
+  ]
+}
