@@ -38,11 +38,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
+import shutil
 import sys
+import time
 import wave
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Audio constants (per Gemini TTS docs: 24kHz, 16-bit signed LE, mono PCM)
@@ -51,6 +55,12 @@ DEFAULT_RATE = 24000
 SAMPLE_WIDTH = 2  # bytes (16-bit)
 CHANNELS = 1
 DEFAULT_MODEL = "gemini-3.1-flash-tts-preview"
+FALLBACK_MODEL = "gemini-2.5-flash-preview-tts"
+DEFAULT_MAX_API_CALLS = 50
+DEFAULT_MAX_SEGMENT_CHARS = 1000
+DEFAULT_CHUNK_CHAR_BUDGET = 6000
+DEFAULT_SINGLE_WARN_SECONDS = 180
+DEFAULT_RETRIES = 2
 
 # The 30 prebuilt Gemini voices (name -> timbre). Canonical list in references/prompting.md.
 VOICES = {
@@ -115,6 +125,77 @@ SENT_END = "。！？!?…\n"
 SOFT_BREAK = "，,、；;：: "
 
 
+@dataclass
+class ApiErrorInfo:
+    category: str
+    status: int | None
+    retryable: bool
+    message: str
+    suggestion: str
+
+
+class GeminiTtsError(RuntimeError):
+    def __init__(self, info: ApiErrorInfo):
+        super().__init__(f"{info.category}: {info.message} {info.suggestion}".strip())
+        self.info = info
+
+
+def _scrub_error_message(message: str) -> str:
+    message = re.sub(r"AIza[0-9A-Za-z_-]{20,}", "[redacted-api-key]", message or "")
+    return message.strip()[:700]
+
+
+def _extract_status(err: BaseException) -> int | None:
+    for attr in ("status_code", "code", "status"):
+        value = getattr(err, attr, None)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    response = getattr(err, "response", None)
+    if response is not None:
+        for attr in ("status_code", "status"):
+            value = getattr(response, attr, None)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str) and value.isdigit():
+                return int(value)
+    m = re.search(r"\b(401|403|404|429|500|502|503|504)\b", str(err))
+    return int(m.group(1)) if m else None
+
+
+def classify_api_error(err: BaseException) -> ApiErrorInfo:
+    status = _extract_status(err)
+    raw = _scrub_error_message(str(err) or err.__class__.__name__)
+    lower = raw.lower()
+    if status in (401, 403) or "api_key_invalid" in lower or "api key not valid" in lower:
+        return ApiErrorInfo(
+            "auth_error", status, False, raw,
+            "Check GEMINI_API_KEY / GOOGLE_API_KEY or --api-key permissions.",
+        )
+    if status == 404:
+        return ApiErrorInfo(
+            "model_not_found", status, False, raw,
+            f"Try --model {FALLBACK_MODEL}.",
+        )
+    if status == 429:
+        return ApiErrorInfo(
+            "quota_or_rate_limit", status, False, raw,
+            "Wait before retrying, reduce segmented line count, or use --estimate first.",
+        )
+    if status in (500, 502, 503, 504):
+        return ApiErrorInfo(
+            "server_error", status, True, raw,
+            "The Gemini TTS docs recommend bounded retry for intermittent server errors.",
+        )
+    if "prohibited_content" in lower or "rejected" in lower:
+        return ApiErrorInfo(
+            "content_rejected", status, False, raw,
+            "Use a clearer TTS preamble and explicitly separate director notes from transcript.",
+        )
+    return ApiErrorInfo("api_error", status, False, raw, "Check the request and model.")
+
+
 # ---------------------------------------------------------------------------
 # Text -> subtitle lines
 # ---------------------------------------------------------------------------
@@ -150,7 +231,32 @@ def _char_wrap(s: str, cap: int) -> list[str]:
     return out
 
 
-def split_into_lines(text: str, max_line_chars: int = 38) -> list[str]:
+def _protect_terms(text: str, terms: list[str] | None) -> tuple[str, dict[str, str]]:
+    mapping: dict[str, str] = {}
+    if not terms:
+        return text, mapping
+    unique = sorted({t.strip() for t in terms if t and t.strip()}, key=len, reverse=True)
+    protected = text
+    for i, term in enumerate(unique):
+        if i > 6400:
+            break
+        placeholder = chr(0xE000 + i)
+        protected = re.sub(re.escape(term), placeholder, protected)
+        mapping[placeholder] = term
+    return protected, mapping
+
+
+def _restore_terms(text: str, mapping: dict[str, str]) -> str:
+    for placeholder, term in mapping.items():
+        text = text.replace(placeholder, term)
+    return text
+
+
+def split_into_lines(
+    text: str,
+    max_line_chars: int = 38,
+    protected_terms: list[str] | None = None,
+) -> list[str]:
     """Split a script into readable subtitle lines.
 
     Strategy (quality-first):
@@ -163,6 +269,7 @@ def split_into_lines(text: str, max_line_chars: int = 38) -> list[str]:
     across two subtitle cards.
     """
     text = re.sub(r"[ \t]+", " ", re.sub(r"\s*\n\s*", "\n", (text or "").strip()))
+    text, protected_map = _protect_terms(text, protected_terms)
     sentences = [s.strip() for s in _split_keep(text, SENT_END) if s.strip()]
 
     lines: list[str] = []
@@ -182,7 +289,7 @@ def split_into_lines(text: str, max_line_chars: int = 38) -> list[str]:
                 cur = cl
         if cur.strip():
             lines.extend(_char_wrap(cur.strip(), max_line_chars))
-    return [ln for ln in lines if ln]
+    return [_restore_terms(ln, protected_map) for ln in lines if ln]
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +385,44 @@ def silence(ms: int, rate: int = DEFAULT_RATE) -> bytes:
     return b"\x00" * (n_frames * SAMPLE_WIDTH * CHANNELS)
 
 
+def sanitize_basename(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name or "").strip("._")
+    return safe or "narration"
+
+
+def resolve_output_paths(out_dir_arg: str, basename_arg: str) -> tuple[Path, str, Path, Path, Path, Path]:
+    out_dir = Path(out_dir_arg).expanduser().resolve()
+    safe_basename = sanitize_basename(basename_arg)
+    srt_path = out_dir / f"{safe_basename}.srt"
+    report_path = out_dir / f"{safe_basename}.report.json"
+    wav_path = out_dir / f"{safe_basename}.wav"
+    mp3_path = out_dir / f"{safe_basename}.mp3"
+    for path in (srt_path, report_path, wav_path, mp3_path):
+        path.resolve().relative_to(out_dir)
+    return out_dir, safe_basename, srt_path, report_path, wav_path, mp3_path
+
+
+def write_json(path: Path, payload: dict) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+
+def load_protected_terms(raw_terms: str, terms_file: str) -> list[str]:
+    terms: list[str] = []
+    if raw_terms:
+        terms.extend(t.strip() for t in raw_terms.split(",") if t.strip())
+    if terms_file:
+        with open(terms_file, encoding="utf-8") as f:
+            terms.extend(line.strip() for line in f if line.strip() and not line.lstrip().startswith("#"))
+    return terms
+
+
+def estimate_chunks(text: str, chunk_char_budget: int) -> int:
+    budget = max(1, chunk_char_budget)
+    return max(1, math.ceil(len(text or "") / budget))
+
+
 # ---------------------------------------------------------------------------
 # Gemini synthesis (lazy import so non-API paths need no SDK / key)
 # ---------------------------------------------------------------------------
@@ -289,53 +434,98 @@ def _parse_rate_from_mime(mime: str | None) -> int:
     return DEFAULT_RATE
 
 
+def _extract_audio_part(resp) -> tuple[bytes, int]:
+    try:
+        part = resp.candidates[0].content.parts[0]
+        inline_data = getattr(part, "inline_data", None)
+        if inline_data is None:
+            raise AttributeError("first response part has no inline_data")
+        pcm = inline_data.data
+    except Exception as e:
+        info = ApiErrorInfo(
+            "no_audio_returned", None, False,
+            "Gemini response did not include audio data.",
+            "Retry with a clearer TTS preamble or a supported TTS model.",
+        )
+        raise GeminiTtsError(info) from e
+    if isinstance(pcm, str):  # some transports hand back base64 text
+        import base64
+        pcm = base64.b64decode(pcm)
+    if not isinstance(pcm, (bytes, bytearray)) or not pcm:
+        info = ApiErrorInfo(
+            "no_audio_returned", None, False,
+            "Gemini response included empty or non-binary audio data.",
+            "Retry with a supported TTS model.",
+        )
+        raise GeminiTtsError(info)
+    rate = _parse_rate_from_mime(getattr(inline_data, "mime_type", None))
+    return bytes(pcm), rate
+
+
 def synthesize(text: str, voice: str, style: str, model: str,
-               api_key: str | None) -> tuple[bytes, int]:
+               api_key: str | None, retries: int = DEFAULT_RETRIES) -> tuple[bytes, int]:
     """Call Gemini TTS for a single text. Returns (pcm_bytes, sample_rate)."""
     try:
         from google import genai
         from google.genai import types
     except Exception as e:  # pragma: no cover - environment dependent
-        raise RuntimeError(
-            "google-genai SDK not installed. Run: pip install google-genai"
-        ) from e
+        info = ApiErrorInfo(
+            "missing_dependency", None, False,
+            "google-genai SDK not installed.",
+            "Run: pip install -r requirements.txt",
+        )
+        raise GeminiTtsError(info) from e
 
     key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not key:
-        raise RuntimeError(
-            "No API key. Set GEMINI_API_KEY (or GOOGLE_API_KEY), or pass --api-key, "
-            "or use --estimate to preview without synthesizing."
+        info = ApiErrorInfo(
+            "missing_api_key", None, False,
+            "No API key.",
+            "Set GEMINI_API_KEY / GOOGLE_API_KEY, pass --api-key, or use --estimate.",
         )
+        raise GeminiTtsError(info)
 
     client = genai.Client(api_key=key)
     # tts-prompter formula: "{Director instructions}: {script}". Style stays in English.
     contents = f"{style.strip()}: {text}" if style and style.strip() else text
-    resp = client.models.generate_content(
-        model=model,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            response_modalities=["AUDIO"],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
-                )
-            ),
-        ),
-    )
-    part = resp.candidates[0].content.parts[0]
-    pcm = part.inline_data.data
-    if isinstance(pcm, str):  # some transports hand back base64 text
-        import base64
-        pcm = base64.b64decode(pcm)
-    rate = _parse_rate_from_mime(getattr(part.inline_data, "mime_type", None))
-    return pcm, rate
+    attempts = max(0, retries) + 1
+    last_info: ApiErrorInfo | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
+                        )
+                    ),
+                ),
+            )
+            return _extract_audio_part(resp)
+        except GeminiTtsError:
+            raise
+        except Exception as e:
+            info = classify_api_error(e)
+            last_info = info
+            if not info.retryable or attempt >= attempts:
+                raise GeminiTtsError(info) from e
+            delay = min(8.0, 0.75 * (2 ** (attempt - 1)))
+            sys.stderr.write(
+                f"[warn] Gemini TTS {info.category} on attempt {attempt}/{attempts}; "
+                f"retrying in {delay:.1f}s.\n"
+            )
+            time.sleep(delay)
+    raise GeminiTtsError(last_info or ApiErrorInfo("api_error", None, False, "API call failed.", ""))
 
 
 # ---------------------------------------------------------------------------
 # Pipelines
 # ---------------------------------------------------------------------------
 def run_segmented(lines, *, voice, style, model, api_key, gap_ms,
-                  mock=False, language=None):
+                  mock=False, language=None, retries=DEFAULT_RETRIES):
     """One TTS call per line; measure each; concatenate; exact SRT timing."""
     combined = bytearray()
     cues: list[Cue] = []
@@ -346,7 +536,7 @@ def run_segmented(lines, *, voice, style, model, api_key, gap_ms,
             dur = estimate_line_seconds(line, language)
             pcm = silence(int(dur * 1000))
         else:
-            pcm, rate = synthesize(line, voice, style, model, api_key)
+            pcm, rate = synthesize(line, voice, style, model, api_key, retries=retries)
             dur = pcm_duration_seconds(pcm, rate)
         start = cursor
         end = cursor + dur
@@ -361,7 +551,7 @@ def run_segmented(lines, *, voice, style, model, api_key, gap_ms,
 
 
 def run_single(lines, *, voice, style, model, api_key, align,
-               mock=False, language=None):
+               mock=False, language=None, retries=DEFAULT_RETRIES):
     """One TTS call for the whole script; derive per-line timing."""
     full_text = " ".join(lines)
     if mock:
@@ -369,7 +559,7 @@ def run_single(lines, *, voice, style, model, api_key, align,
         total = sum(estimate_line_seconds(ln, language) for ln in lines)
         pcm = silence(int(total * 1000))
     else:
-        pcm, rate = synthesize(full_text, voice, style, model, api_key)
+        pcm, rate = synthesize(full_text, voice, style, model, api_key, retries=retries)
         total = pcm_duration_seconds(pcm, rate)
 
     cues: list[Cue] = []
@@ -423,6 +613,76 @@ def _align_with_whisper(pcm: bytes, rate: int, lines: list[str]) -> list[Cue]:
 
 
 # ---------------------------------------------------------------------------
+# Artifact validation
+# ---------------------------------------------------------------------------
+def validate_cues(lines: list[str], cues: list[Cue]) -> list[str]:
+    errors: list[str] = []
+    if len(lines) != len(cues):
+        errors.append("cue count does not match subtitle line count")
+    for i, c in enumerate(cues):
+        if c.end <= c.start:
+            errors.append(f"cue {i + 1} has non-positive duration")
+        if i and c.start < cues[i - 1].end - 1e-9:
+            errors.append(f"cue {i + 1} overlaps previous cue")
+        if i < len(lines) and c.text != lines[i]:
+            errors.append(f"cue {i + 1} text changed")
+    return errors
+
+
+def validate_audio_file(audio_path: Path) -> list[str]:
+    errors: list[str] = []
+    if not audio_path.exists():
+        return [f"audio file missing: {audio_path}"]
+    if audio_path.stat().st_size <= 0:
+        return [f"audio file is empty: {audio_path}"]
+    suffix = audio_path.suffix.lower()
+    if suffix == ".wav":
+        try:
+            with wave.open(str(audio_path), "rb") as wf:
+                if wf.getnframes() <= 0:
+                    errors.append("wav has no frames")
+                if wf.getnchannels() != CHANNELS:
+                    errors.append(f"wav channel count is {wf.getnchannels()}, expected {CHANNELS}")
+        except Exception as e:
+            errors.append(f"wav is not parseable: {e}")
+    elif suffix == ".mp3" and shutil.which("ffprobe"):
+        import subprocess
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(audio_path)],
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            errors.append(f"mp3 is not parseable by ffprobe: {r.stderr.strip()}")
+    return errors
+
+
+def validate_outputs(
+    lines: list[str],
+    cues: list[Cue],
+    pcm: bytes,
+    rate: int,
+    audio_path: Path,
+    srt_path: Path,
+) -> list[str]:
+    errors = validate_cues(lines, cues)
+    if not pcm:
+        errors.append("audio PCM is empty")
+    else:
+        audio_seconds = pcm_duration_seconds(pcm, rate)
+        if audio_seconds <= 0:
+            errors.append("audio duration is non-positive")
+        if cues and audio_seconds + 0.25 < cues[-1].end:
+            errors.append("audio duration ends before final subtitle cue")
+    if not srt_path.exists():
+        errors.append(f"srt file missing: {srt_path}")
+    elif srt_path.stat().st_size <= 0:
+        errors.append(f"srt file is empty: {srt_path}")
+    errors.extend(validate_audio_file(audio_path))
+    return errors
+
+
+# ---------------------------------------------------------------------------
 # Self-test (offline, no API)
 # ---------------------------------------------------------------------------
 def self_test() -> int:
@@ -438,6 +698,9 @@ def self_test() -> int:
     lines = split_into_lines(zh, max_line_chars=12)
     check("zh splits into >=3 lines", len(lines) >= 3)
     check("no line exceeds cap+slack", all(len(l) <= 16 for l in lines))
+    protected = split_into_lines("OpenAI Gemini 3.1 是一個受保護術語。", max_line_chars=8,
+                                 protected_terms=["OpenAI Gemini 3.1"])
+    check("protected term stays intact", any("OpenAI Gemini 3.1" in l for l in protected))
 
     print("self-test: pcm duration math")
     one_sec = silence(1000)
@@ -450,6 +713,7 @@ def self_test() -> int:
     check("monotonic non-overlapping", all(
         cues[i].start >= cues[i - 1].end - 1e-9 for i in range(1, len(cues))))
     check("cue text == source line", all(c.text == l for c, l in zip(cues, lines)))
+    check("cue validator accepts mock cues", not validate_cues(lines, cues))
     audio_dur = pcm_duration_seconds(pcm, rate)
     check("audio covers last cue end", audio_dur + 1e-6 >= cues[-1].end - 0.2)
 
@@ -486,11 +750,12 @@ def main(argv=None) -> int:
     p.add_argument("--voice", default="Charon",
                    help="Prebuilt Gemini voice name (default: Charon). See --list-voices.")
     p.add_argument("--language", default="",
-                   help="BCP-47 hint (e.g. cmn-tw, en-US). Selects regional voice + "
-                        "rate-table row; does not force output language.")
+                   help="BCP-47 hint used for duration estimation and reporting "
+                        "(e.g. cmn-tw, en-US). It does not force spoken language; "
+                        "put language/accent in --style and script text.")
     p.add_argument("--model", default=DEFAULT_MODEL,
                    help=f"TTS model id (default: {DEFAULT_MODEL}). If it 404s, try "
-                        "gemini-2.5-flash-preview-tts.")
+                        f"{FALLBACK_MODEL}.")
     p.add_argument("--mode", choices=["segmented", "single"], default="segmented",
                    help="segmented=per-line synth+exact timing (default); "
                         "single=one call + derived timing.")
@@ -501,13 +766,37 @@ def main(argv=None) -> int:
     p.add_argument("--basename", default="narration", help="Output file basename.")
     p.add_argument("--format", choices=["wav", "mp3"], default="wav",
                    help="Audio format (mp3 needs ffmpeg).")
+    p.add_argument("--strict-format", action="store_true",
+                   help="Fail if requested --format cannot be produced instead of keeping WAV.")
     p.add_argument("--gap-ms", type=int, default=120,
                    help="Silence between segments in segmented mode (default 120ms).")
     p.add_argument("--max-line-chars", type=int, default=38,
                    help="Max characters per subtitle line before wrapping (default 38).")
+    p.add_argument("--max-segment-chars", type=int, default=DEFAULT_MAX_SEGMENT_CHARS,
+                   help=f"Fail if any single TTS segment exceeds this many chars "
+                        f"(default {DEFAULT_MAX_SEGMENT_CHARS}).")
+    p.add_argument("--max-api-calls", type=int, default=DEFAULT_MAX_API_CALLS,
+                   help=f"Block segmented synthesis above this many API calls unless "
+                        f"--force is set (default {DEFAULT_MAX_API_CALLS}).")
+    p.add_argument("--chunk-char-budget", type=int, default=DEFAULT_CHUNK_CHAR_BUDGET,
+                   help=f"Rough characters per long-script chunk in reports "
+                        f"(default {DEFAULT_CHUNK_CHAR_BUDGET}).")
+    p.add_argument("--single-warn-seconds", type=float, default=DEFAULT_SINGLE_WARN_SECONDS,
+                   help=f"Warn when single mode is estimated above this many seconds "
+                        f"(default {DEFAULT_SINGLE_WARN_SECONDS}).")
     p.add_argument("--estimate", action="store_true",
                    help="No API call: predict timing from the rate table, write SRT + "
                         "report only. Preview segmentation before paying for synthesis.")
+    p.add_argument("--dry-run-cost", action="store_true",
+                   help="No API call: write SRT + report with estimated calls/chunks and exit.")
+    p.add_argument("--force", action="store_true",
+                   help="Override long-script preflight blocks.")
+    p.add_argument("--retries", type=int, default=DEFAULT_RETRIES,
+                   help=f"Retry count for retryable Gemini server errors (default {DEFAULT_RETRIES}).")
+    p.add_argument("--protect-terms", default="",
+                   help="Comma-separated terms that must not be split across subtitle lines.")
+    p.add_argument("--protect-file", default="",
+                   help="UTF-8 file with one protected term per line; # comments ignored.")
     p.add_argument("--api-key", default="",
                    help="Gemini API key (else GEMINI_API_KEY / GOOGLE_API_KEY env).")
     p.add_argument("--list-voices", action="store_true", help="List the 30 voices and exit.")
@@ -521,6 +810,28 @@ def main(argv=None) -> int:
         for name, timbre in VOICES.items():
             print(f"{name:16s} {timbre}")
         return 0
+    if args.voice not in VOICES:
+        sys.stderr.write(f"[error] Unknown voice: {args.voice}. Run --list-voices.\n")
+        return 2
+    if args.max_line_chars <= 0:
+        p.error("--max-line-chars must be positive")
+    if args.max_segment_chars <= 0:
+        p.error("--max-segment-chars must be positive")
+    if args.max_api_calls <= 0:
+        p.error("--max-api-calls must be positive")
+    if args.gap_ms < 0:
+        p.error("--gap-ms must be non-negative")
+
+    try:
+        out_dir, safe_basename, srt_path, report_path, wav_path, mp3_path = resolve_output_paths(
+            args.out_dir, args.basename
+        )
+    except Exception as e:
+        sys.stderr.write(f"[error] invalid output path: {e}\n")
+        return 2
+    if safe_basename != args.basename:
+        sys.stderr.write(f"[warn] sanitized basename to '{safe_basename}'.\n")
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # Resolve script text.
     if args.script_file:
@@ -531,35 +842,108 @@ def main(argv=None) -> int:
     else:
         p.error("provide --text or --script-file (or --self-test / --list-voices)")
         return 2
-    if args.voice not in VOICES:
-        sys.stderr.write(f"[warn] '{args.voice}' is not a known prebuilt voice.\n")
 
-    lines = split_into_lines(text, args.max_line_chars)
+    try:
+        protected_terms = load_protected_terms(args.protect_terms, args.protect_file)
+    except Exception as e:
+        sys.stderr.write(f"[error] could not load protected terms: {e}\n")
+        return 2
+
+    lines = split_into_lines(text, args.max_line_chars, protected_terms=protected_terms)
     if not lines:
         p.error("script produced no subtitle lines")
         return 2
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    srt_path = os.path.join(args.out_dir, args.basename + ".srt")
     lang = args.language or None
+    estimated_api_calls = len(lines) if args.mode == "segmented" else 1
+    estimated_total_seconds = sum(estimate_line_seconds(ln, lang) for ln in lines)
+    if args.mode == "segmented" and len(lines) > 1:
+        estimated_total_seconds += (len(lines) - 1) * (args.gap_ms / 1000.0)
+    warnings: list[str] = []
+    if args.mode == "single" and estimated_total_seconds > args.single_warn_seconds:
+        warnings.append(
+            "single mode is estimated above a few minutes; Gemini TTS quality may drift. "
+            "Use segmented mode or split the script into chunks."
+        )
+    long_segments = [(i + 1, len(ln)) for i, ln in enumerate(lines) if len(ln) > args.max_segment_chars]
+    if long_segments:
+        report = {
+            "blocked": True,
+            "reason": "one or more subtitle lines exceed --max-segment-chars",
+            "max_segment_chars": args.max_segment_chars,
+            "long_segments": [{"line": i, "chars": n} for i, n in long_segments],
+            "srt": str(srt_path),
+            "report": str(report_path),
+        }
+        write_json(report_path, report)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 2
+    if (
+        not args.estimate
+        and not args.dry_run_cost
+        and args.mode == "segmented"
+        and estimated_api_calls > args.max_api_calls
+        and not args.force
+    ):
+        report = {
+            "blocked": True,
+            "reason": f"segmented mode would issue {estimated_api_calls} TTS calls",
+            "suggestion": "use --estimate first, reduce --max-line-chars, use --mode single, or rerun with --force",
+            "estimated_api_calls": estimated_api_calls,
+            "estimated_total_seconds": round(estimated_total_seconds, 2),
+            "estimated_chunks": estimate_chunks(text, args.chunk_char_budget),
+            "lines": len(lines),
+            "srt": str(srt_path),
+            "report": str(report_path),
+        }
+        write_json(report_path, report)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 2
+    if args.format == "mp3" and args.strict_format and not shutil.which("ffmpeg"):
+        report = {
+            "blocked": True,
+            "reason": "--format mp3 requested with --strict-format, but ffmpeg is not installed",
+            "suggestion": "install ffmpeg or rerun with --format wav",
+            "report": str(report_path),
+        }
+        write_json(report_path, report)
+        sys.stderr.write("[error] ffmpeg is required for --format mp3 --strict-format.\n")
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 2
 
     # ---- Estimate mode: SRT + report only, no synthesis ----
-    if args.estimate:
+    if args.estimate or args.dry_run_cost:
         cues, cursor = [], 0.0
         for i, ln in enumerate(lines, 1):
             dur = estimate_line_seconds(ln, lang)
             cues.append(Cue(i, cursor, cursor + dur, ln))
             cursor += dur + args.gap_ms / 1000.0
-        with open(srt_path, "w", encoding="utf-8") as f:
+        with srt_path.open("w", encoding="utf-8") as f:
             f.write(build_srt(cues))
+        validation_errors = validate_cues(lines, cues)
+        if validation_errors:
+            report = {
+                "mode": "estimate" if args.estimate else "dry-run-cost",
+                "validation": "failed",
+                "validation_errors": validation_errors,
+                "srt": str(srt_path),
+                "report": str(report_path),
+            }
+            write_json(report_path, report)
+            sys.stderr.write(f"[error] validation failed: {'; '.join(validation_errors)}\n")
+            return 1
         report = {
-            "mode": "estimate", "lines": len(lines),
+            "mode": "estimate" if args.estimate else "dry-run-cost",
+            "lines": len(lines),
+            "estimated_api_calls": estimated_api_calls,
+            "estimated_chunks": estimate_chunks(text, args.chunk_char_budget),
             "estimated_total_seconds": round(cues[-1].end, 2),
-            "srt": srt_path, "note": "Durations are rate-table predictions, not measured.",
+            "srt": str(srt_path),
+            "report": str(report_path),
+            "warnings": warnings,
+            "note": "Durations are rate-table predictions, not measured.",
         }
-        rep_path = os.path.join(args.out_dir, args.basename + ".report.json")
-        with open(rep_path, "w", encoding="utf-8") as f:
-            json.dump(report, f, ensure_ascii=False, indent=2)
+        write_json(report_path, report)
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
 
@@ -568,34 +952,95 @@ def main(argv=None) -> int:
         if args.mode == "segmented":
             pcm, cues, rate = run_segmented(
                 lines, voice=args.voice, style=args.style, model=args.model,
-                api_key=args.api_key or None, gap_ms=args.gap_ms, language=lang)
+                api_key=args.api_key or None, gap_ms=args.gap_ms, language=lang,
+                retries=args.retries)
         else:
             pcm, cues, rate = run_single(
                 lines, voice=args.voice, style=args.style, model=args.model,
-                api_key=args.api_key or None, align=args.align, language=lang)
-    except RuntimeError as e:
-        sys.stderr.write(f"[error] {e}\n")
+                api_key=args.api_key or None, align=args.align, language=lang,
+                retries=args.retries)
+    except GeminiTtsError as e:
+        report = {
+            "mode": args.mode,
+            "model": args.model,
+            "voice": args.voice,
+            "error": e.info.category,
+            "status": e.info.status,
+            "message": e.info.message,
+            "suggestion": e.info.suggestion,
+            "report": str(report_path),
+        }
+        write_json(report_path, report)
+        sys.stderr.write(f"[error] {e.info.category}: {e.info.message} {e.info.suggestion}\n")
+        return 1
+    except Exception as e:
+        message = _scrub_error_message(str(e) or e.__class__.__name__)
+        report = {
+            "mode": args.mode,
+            "model": args.model,
+            "voice": args.voice,
+            "error": "unexpected_failure",
+            "message": message,
+            "report": str(report_path),
+        }
+        write_json(report_path, report)
+        sys.stderr.write(f"[error] unexpected failure: {message}\n")
         return 1
 
-    wav_path = os.path.join(args.out_dir, args.basename + ".wav")
-    write_wav(pcm, wav_path, rate)
+    write_wav(pcm, str(wav_path), rate)
     audio_path = wav_path
     if args.format == "mp3":
-        mp3_path = os.path.join(args.out_dir, args.basename + ".mp3")
-        if wav_to_mp3(wav_path, mp3_path):
+        if wav_to_mp3(str(wav_path), str(mp3_path)):
             audio_path = mp3_path
         else:
-            sys.stderr.write("[warn] ffmpeg unavailable; kept WAV.\n")
+            message = "ffmpeg unavailable or mp3 conversion failed; kept WAV"
+            if args.strict_format:
+                report = {
+                    "mode": args.mode,
+                    "model": args.model,
+                    "voice": args.voice,
+                    "error": "format_conversion_failed",
+                    "message": message,
+                    "audio": str(wav_path),
+                    "report": str(report_path),
+                }
+                write_json(report_path, report)
+                sys.stderr.write(f"[error] {message}.\n")
+                return 1
+            warnings.append(message)
+            sys.stderr.write(f"[warn] {message}.\n")
 
-    with open(srt_path, "w", encoding="utf-8") as f:
+    with srt_path.open("w", encoding="utf-8") as f:
         f.write(build_srt(cues))
+
+    validation_errors = validate_outputs(lines, cues, pcm, rate, audio_path, srt_path)
+    if validation_errors:
+        report = {
+            "mode": args.mode,
+            "model": args.model,
+            "voice": args.voice,
+            "validation": "failed",
+            "validation_errors": validation_errors,
+            "audio": str(audio_path),
+            "srt": str(srt_path),
+            "report": str(report_path),
+        }
+        write_json(report_path, report)
+        sys.stderr.write(f"[error] output validation failed: {'; '.join(validation_errors)}\n")
+        return 1
 
     report = {
         "mode": args.mode, "model": args.model, "voice": args.voice,
-        "lines": len(lines), "audio": audio_path, "srt": srt_path,
+        "lines": len(lines), "audio": str(audio_path), "srt": str(srt_path),
+        "report": str(report_path),
         "audio_seconds": round(pcm_duration_seconds(pcm, rate), 2),
         "sample_rate": rate,
+        "estimated_api_calls": estimated_api_calls,
+        "estimated_chunks": estimate_chunks(text, args.chunk_char_budget),
+        "warnings": warnings,
+        "validation": "pass",
     }
+    write_json(report_path, report)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 

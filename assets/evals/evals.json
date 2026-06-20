@@ -154,6 +154,86 @@
         "對長腳本先用 --estimate 預估行數/呼叫數",
         "在大量 API 呼叫前先請使用者確認"
       ]
+    },
+    {
+      "id": 9,
+      "name": "invalid-voice-fail-fast",
+      "type": "functional",
+      "language": "en",
+      "trigger_class": "direct",
+      "coverage_tags": [
+        "failure-mode",
+        "edge-case",
+        "should-trigger"
+      ],
+      "prompt": "Run Gemini TTS with --voice NotARealVoice for the script: Hello world.",
+      "expected_output": "CLI returns non-zero before any API call and tells the user to run --list-voices.",
+      "files": [],
+      "expectations": [
+        "未知 voice 直接 fail-fast",
+        "不呼叫 Gemini API",
+        "錯誤訊息包含 --list-voices"
+      ]
+    },
+    {
+      "id": 10,
+      "name": "path-traversal-basename",
+      "type": "functional",
+      "language": "en",
+      "trigger_class": "direct",
+      "coverage_tags": [
+        "failure-mode",
+        "edge-case",
+        "should-trigger"
+      ],
+      "prompt": "Generate an estimate with --basename '../bad/name' and --out-dir ./out.",
+      "expected_output": "CLI sanitizes the basename, writes artifacts under --out-dir, and reports absolute paths.",
+      "files": [],
+      "expectations": [
+        "basename 被白名單安全化",
+        "所有輸出 resolve 後仍在 --out-dir 內",
+        "report 內的 srt/report 欄位為絕對路徑"
+      ]
+    },
+    {
+      "id": 11,
+      "name": "mp3-no-ffmpeg-strict",
+      "type": "functional",
+      "language": "en",
+      "trigger_class": "direct",
+      "coverage_tags": [
+        "failure-mode",
+        "edge-case",
+        "should-trigger"
+      ],
+      "prompt": "Synthesize a short Gemini TTS clip with --format mp3 --strict-format when ffmpeg is unavailable.",
+      "expected_output": "CLI returns non-zero and writes a report explaining that ffmpeg is required; non-strict mode may keep WAV with a warning.",
+      "files": [],
+      "expectations": [
+        "strict mode 不接受 WAV fallback",
+        "錯誤訊息指出 ffmpeg 或 mp3 conversion 問題",
+        "report 不宣稱 validation pass"
+      ]
+    },
+    {
+      "id": 12,
+      "name": "api-500-retry",
+      "type": "functional",
+      "language": "en",
+      "trigger_class": "direct",
+      "coverage_tags": [
+        "failure-mode",
+        "edge-case",
+        "should-trigger"
+      ],
+      "prompt": "Gemini TTS intermittently returns HTTP 500 while generating audio. Verify retry behavior.",
+      "expected_output": "CLI classifies 500/503 as retryable, performs bounded retry with exponential backoff, then either succeeds or returns a classified server_error report.",
+      "files": [],
+      "expectations": [
+        "500/502/503/504 被分類為 retryable server_error",
+        "retry 次數受 --retries 限制",
+        "最終失敗時 report 包含 error/status/suggestion 且不輸出成功檔案清單"
+      ]
     }
   ]
 }

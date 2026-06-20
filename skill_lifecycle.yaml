@@ -5,10 +5,10 @@ archetype: executor
 primary_structure_pattern: pipeline
 lifecycle:
   created_at: 2026-06-20
-  last_validated_at: 2026-06-20
+  last_validated_at: 2026-06-21
   last_released_at: null
   review_interval_days: 60
-  next_review_due: 2026-08-19
+  next_review_due: 2026-08-20
 support:
   primary_hosts:
     - agent-skills
@@ -21,10 +21,17 @@ risk:
 dependencies:
   scripts:
     - scripts/gemini_tts.py
+  packages:
+    - requirements.txt
   references:
     - references/readiness_report.md
     - references/prompting.md
     - references/srt-strategy.md
+ci:
+  required:
+    - python scripts/gemini_tts.py --self-test
+    - python scripts/gemini_tts.py --estimate --text "上古時代，有一位戰神蚩尤。" --language cmn-tw
+    - python scripts/gemini_tts.py --dry-run-cost --text "一。二。三。四。五。六。" --max-api-calls 3
 stewardship:
   reviewers: []
   stale_after_days: 120

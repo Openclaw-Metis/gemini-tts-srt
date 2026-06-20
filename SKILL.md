@@ -1,7 +1,7 @@
 ---
 name: gemini-tts-srt
 description: "用 Google Gemini API 的文字轉語音模型把腳本配音成音檔，並同時輸出時間軸對齊的 SRT 字幕。Use when 使用者要『用 Gemini 配音 / 生成旁白 / Gemini text-to-speech』、要『配音同時要字幕 / 要 SRT』、或把一段文字轉成可放進影片的語音加字幕（觸發語如『用 gemini 幫這段配音並產 srt』『generate narration with subtitles using gemini tts』『Gemini TTS 字幕』『把這段旁白配音輸出 mp3 和字幕』）。本技能負責：挑 prebuilt voice、套用英文風格指令、呼叫 Gemini TTS、量測每段時長、輸出 wav/mp3 與 SRT。Do not use when 只想規劃 TTS 提示詞而不實際生成（用 tts-prompter）、要搜尋下載現成素材影片或配樂（用 media-downloader）、要用非 Gemini 的 TTS 例如 Edge TTS、或只是要翻譯字幕。成功輸出是一個音檔加一個 cue 數等於腳本行數的 .srt 加一份 JSON 摘要。"
-version: 2026.6.20
+version: 2026.6.21
 metadata:
   author: "Openclaw-Metis"
   language: zh-TW
@@ -37,12 +37,12 @@ Do not use when:
 Inputs:
 - 必要：腳本文字（`--text` 或 `--script-file`）。
 - 必要（實際合成時）：Gemini API 金鑰（環境變數 `GEMINI_API_KEY` 或 `GOOGLE_API_KEY`，或 `--api-key`）。
-- 可選：voice 名稱、BCP-47 語言提示、英文風格指令、模式（segmented／single）、輸出格式（wav／mp3）、每行字數上限、段間靜音。
+- 可選：voice 名稱、BCP-47 語言提示、英文風格指令、模式（segmented／single）、輸出格式（wav／mp3）、每行字數上限、段間靜音、`--max-api-calls`、`--strict-format`、`--protect-terms`／`--protect-file`。
 
 Successful output:
 - 一個音檔（`<basename>.wav` 或 `.mp3`）。
 - 一個 SRT 檔（`<basename>.srt`），其 cue 數量等於切出的字幕行數，時間戳單調遞增不重疊，字幕文字即原始腳本。
-- 一份 JSON 摘要（模式、模型、voice、行數、音檔秒數、檔案路徑）。
+- 一份固定落地的 JSON report（`<basename>.report.json`），內容含模式、模型、voice、行數、音檔秒數、絕對檔案路徑與 validation 狀態。
 </decision_boundary>
 
 ## Primary use cases (2-3)
@@ -97,7 +97,7 @@ Quantitative:
 
 Qualitative:
 - 字幕文字零辨識錯誤（直接用原稿）。
-- 多字詞／人名不被切斷在兩張字幕卡。
+- 多字詞／人名預設盡量不被切斷；關鍵品牌、人名、術語用 `--protect-terms` 或 `--protect-file` 強化。
 - 新使用者第一次即可產出可用的音檔與字幕。
 </success_criteria>
 
@@ -112,7 +112,7 @@ Step 1: Craft the style instruction
 - Action: 依內建整合的提示詞框架（`references/prompting.md`）的「Director instructions : Script」公式，用英文寫一段風格指令（語氣／口音／節奏），放進 `--style`；風格指令永遠不會被唸出來。挑一個與角色相符的 voice。
 - Input: 使用者想要的語氣、場景、口音；`references/prompting.md` 的 voice 清單。
 - Output: 一段英文 `--style` 字串與一個 voice 名稱。
-- Validation: 風格指令為英文；voice 在 30 個 prebuilt voices 之內（`--list-voices` 可列）。
+- Validation: 風格指令為英文；voice 必須在 30 個 prebuilt voices 之內（`--list-voices` 可列），未知 voice 會 fail-fast，不會花掉 API 呼叫。
 
 Step 2: Choose synthesis mode
 - Action: 預設用 `--mode segmented`（逐句合成、實測時長、字幕時間最準）；只有在使用者特別要求整段語氣連貫時改用 `--mode single`（可再加 `--align whisper` 做詞級對齊，需安裝 faster-whisper）。
@@ -121,19 +121,19 @@ Step 2: Choose synthesis mode
 - Validation: segmented 模式下每段都會被獨立量測；single 模式下若無法詞級對齊則自動退回比例分配。
 
 Step 3: Preview timing before paid synthesis (recommended)
-- Action: 先跑 `python scripts/gemini_tts.py --estimate --language <code> --max-line-chars <n> --text "<script>"`，檢查斷句與預估總長是否符合需求；若有時長預算且超標，回 Step 1 縮短腳本。
-- Input: 腳本、語言、每行字數上限。
-- Output: 預覽用 `.srt` 與 `.report.json`（不呼叫 API）。
-- Validation: 預估總秒數在可接受範圍；字幕斷句沒有把人名／詞語切斷。
+- Action: 先跑 `python scripts/gemini_tts.py --estimate --language <code> --max-line-chars <n> --text "<script>"`，或用 `--dry-run-cost` 只看預估呼叫數／chunks；檢查斷句、預估總長與 `estimated_api_calls` 是否符合需求。對很長的 segmented 腳本，CLI 會用 `--max-api-calls` fail-fast，除非明確加 `--force`。
+- Input: 腳本、語言、每行字數上限、成本門檻；必要時加入 `--protect-terms` 或 `--protect-file` 避免人名、品牌、術語被切開。
+- Output: 預覽用 `.srt` 與 `.report.json`（不呼叫 API），report 含 `estimated_api_calls`、`estimated_chunks` 與絕對路徑。
+- Validation: 預估總秒數與呼叫次數在可接受範圍；字幕斷句沒有把關鍵人名／詞語切斷；長稿 blocked report 不得被視為成功合成。
 
 Step 4: Synthesize audio and build SRT
-- Action: 跑 `python scripts/gemini_tts.py --text "<script>" --voice <name> --language <code> --style "<en style>" --model <id> --format <wav|mp3> --out-dir <dir> --basename <name>`（必要時加 `--mode single`）。模型預設 `gemini-3.1-flash-tts-preview`；若回 404 改用 `gemini-2.5-flash-preview-tts`。
+- Action: 跑 `python scripts/gemini_tts.py --text "<script>" --voice <name> --language <code> --style "<en style>" --model <id> --format <wav|mp3> --out-dir <dir> --basename <name>`（必要時加 `--mode single`、`--strict-format`、`--protect-terms`）。模型預設 `gemini-3.1-flash-tts-preview`；若回 404 改用 `gemini-2.5-flash-preview-tts`。
 - Input: Step 0–3 確認的參數與金鑰。
-- Output: 音檔、`.srt`、JSON 摘要（印在 stdout）。
-- Validation: stdout 的摘要 `lines` 等於 `.srt` 的 cue 數；`audio_seconds` 為正且與字幕最後一個 cue 結束時間相符。
+- Output: 音檔、`.srt`、固定 `.report.json`（並印同一份 JSON 摘要在 stdout）。
+- Validation: 腳本會自動驗證 `lines` 等於 `.srt` cue 數、時間軸不重疊、`audio_seconds` 為正且音檔可解析；任何 validation error 都會 return non-zero。
 
 Step 5: Validate and report
-- Action: 確認音檔可被 `ffprobe` 解析、SRT 時間戳單調遞增不重疊、字幕文字等於原稿；回報檔案絕對路徑、時長、所用模型與 voice。失敗時指出是金鑰、模型名稱、配額還是腳本問題並停止。
+- Action: 讀取腳本產出的 `.report.json`，確認 `validation: pass`、音檔與 SRT 都是絕對路徑；回報檔案絕對路徑、時長、所用模型與 voice。失敗時指出是金鑰、模型名稱、配額、格式轉檔、長稿 preflight 還是 artifact validation 問題並停止。
 - Input: Step 4 產出的檔案與 stdout 摘要。
 - Output: 給使用者的完成摘要（檔案路徑 + 時長 + 模型/voice）。
 - Validation: cue 數一致、時間軸單調、無損壞檔；任何一項不過即回報為失敗，不宣稱成功。
@@ -142,7 +142,7 @@ Step 5: Validate and report
 <output_contract>
 Return exactly these sections or fields in this order:
 1. 完成摘要（1 行）：模式、模型、voice、總秒數。
-2. 檔案清單：音檔與 .srt 的絕對路徑，每行一個。
+2. 檔案清單：音檔、`.srt`、`.report.json` 的絕對路徑，每行一個。
 3. 後續建議（可選，1–2 行）：例如「需要 mp3 改 --format mp3」「字幕太長改小 --max-line-chars」。
 
 Formatting rules:
@@ -154,16 +154,18 @@ Formatting rules:
 
 <tool_rules>
 - 唯一執行入口是 `scripts/gemini_tts.py`；不要在對話中自行用 requests／urllib 重做 Gemini 呼叫或 SRT 邏輯。
-- 子指令對應：實際合成用預設模式；預覽用 `--estimate`；列 voice 用 `--list-voices`；離線驗證用 `--self-test`。
+- 子指令對應：實際合成用預設模式；預覽用 `--estimate`；只看成本／呼叫數用 `--dry-run-cost`；列 voice 用 `--list-voices`；離線驗證用 `--self-test`。
 - 金鑰只從環境變數或 `--api-key` 取得，絕不寫進 skill 資料夾或印出。
-- 實際合成（segmented 模式）會對每行各送一次 API、會消耗配額；對很長的腳本先用 `--estimate` 預估行數與成本，必要時告知使用者預估呼叫次數再執行。
+- 實際合成（segmented 模式）會對每行各送一次 API、會消耗配額；CLI 會用 `--max-api-calls` 阻擋大量呼叫，只有使用者確認後才加 `--force`。
+- `--format mp3` 預設在 ffmpeg 不可用時保留 WAV 並 warning；自動化 pipeline 要使用 `--strict-format` 讓格式不符直接失敗。
+- 關鍵人名、品牌、術語使用 `--protect-terms` 或 `--protect-file`；不要只靠 `--max-line-chars` 猜測不會被切斷。
 - 風格指令一律英文；voice 必須在 30 個 prebuilt voices 內。
 </tool_rules>
 
 <default_follow_through_policy>
 - Directly do: 讀腳本、跑 `--estimate`／`--self-test`／`--list-voices`、把輸出寫到使用者指定或預設 `./out`、實際呼叫 Gemini TTS 生成使用者明確要求的這一段配音。
-- Ask first: 對「很長」的腳本（預估會產生大量 segmented 呼叫、明顯消耗配額或費用）先告知預估呼叫次數並確認；覆寫已存在的同名輸出檔前先告知。
-- Stop and report: 缺腳本、缺金鑰、模型名稱被拒（404）、配額用盡、或 SRT cue 數與行數對不上時，停止並說明原因與下一步。
+- Ask first: 對「很長」的腳本（預估會產生大量 segmented 呼叫、明顯消耗配額或費用）先告知 `.report.json` 的預估呼叫次數；使用者確認後才用 `--force`。覆寫已存在的同名輸出檔前先告知。
+- Stop and report: 缺腳本、缺金鑰、未知 voice、模型名稱被拒（404）、配額用盡、格式轉檔不符合 `--strict-format`、長稿 preflight 被擋，或 SRT cue 數與行數對不上時，停止並說明原因與下一步。
 </default_follow_through_policy>
 
 <examples>
@@ -173,8 +175,8 @@ Input:
 
 Output:
 1. 先用 `--estimate --language cmn-tw --max-line-chars 18` 預覽斷句與總長並確認沒切斷人名。
-2. 跑 `gemini_tts.py --text "<稿>" --voice Sulafat --language cmn-tw --style "Speak in Taiwanese Mandarin, calm documentary narrator, steady pace" --format mp3 --basename chiyou --out-dir ./out`。
-3. 回報：narration.mp3 + chiyou.srt 的絕對路徑、總秒數、模型與 voice。
+2. 跑 `gemini_tts.py --text "<稿>" --voice Sulafat --language cmn-tw --style "Speak in Taiwanese Mandarin, calm documentary narrator, steady pace" --format mp3 --strict-format --protect-terms 蚩尤 --basename chiyou --out-dir ./out`。
+3. 回報：chiyou.mp3、chiyou.srt、chiyou.report.json 的絕對路徑、總秒數、模型與 voice。
 
 Example 2
 Input:
@@ -183,7 +185,7 @@ Input:
 Output:
 1. 說明無金鑰可用 `--estimate` 預覽。
 2. 跑 `gemini_tts.py --estimate --language cmn-tw --max-line-chars 18 --text "<稿>"`。
-3. 回報 .srt 與 .report.json，並提醒預估時長為語速表推估、實際合成後以實測為準。
+3. 回報 .srt 與 .report.json，並提醒預估時長與呼叫數為語速表推估、實際合成後以實測為準。
 </examples>
 
 <model_notes>
@@ -222,6 +224,22 @@ Output:
   - Given: 一段含人名「蚩尤」的中文稿、`--max-line-chars 18`
   - When: 跑 `--estimate`
   - Then: 產出 .srt，cue 數＝行數，人名不被切斷，時間戳單調遞增
+- Test case: invalid voice fail-fast
+  - Given: `--voice NotARealVoice`
+  - When: 跑 `--estimate` 或實際合成
+  - Then: return non-zero，提示 `Run --list-voices`，不呼叫 Gemini API
+- Test case: path traversal basename
+  - Given: `--basename "../bad/name"`
+  - When: 跑 `--estimate`
+  - Then: 輸出檔名被安全化，report 內路徑為 `--out-dir` 下的絕對路徑
+- Test case: long segmented preflight
+  - Given: `--mode segmented` 且字幕行數超過 `--max-api-calls`
+  - When: 未加 `--force` 執行實際合成
+  - Then: return non-zero，寫出 blocked `.report.json`，不呼叫 Gemini API
+- Test case: MP3 strict format
+  - Given: `--format mp3 --strict-format` 且 ffmpeg 缺失或轉檔失敗
+  - When: 跑實際合成
+  - Then: return non-zero；預設非 strict 則保留 WAV 並 warning
 - Test case: 離線管線自測
   - Given: 無金鑰環境
   - When: 跑 `--self-test`
@@ -276,6 +294,7 @@ Output:
 - Keep the core skill folder as the single source of truth; host-specific wrappers should stay thin
 - Document supported hosts, auth requirements, approval boundaries, and persistence expectations outside the skill folder
 - Repo-level README belongs *outside* this skill folder.
+- Install runtime dependency with `pip install -r requirements.txt`; optional `pip install faster-whisper` enables `--align whisper`; mp3 output requires ffmpeg.
 
 ## Troubleshooting
 
@@ -284,8 +303,12 @@ Output:
 - Fix: 改 `--model gemini-2.5-flash-preview-tts`。
 
 - Symptom: 字幕一句被切成兩張卡、人名被切斷
-- Cause: `--max-line-chars` 設太小。
-- Fix: CJK 建議 16–20；先用 `--estimate` 預覽再調。
+- Cause: `--max-line-chars` 設太小，或該詞沒有自然標點保護。
+- Fix: CJK 建議 16–20；先用 `--estimate` 預覽再調，關鍵詞加 `--protect-terms` 或 `--protect-file`。
+
+- Symptom: 實際合成前輸出 blocked report
+- Cause: segmented 模式預估 API 呼叫數超過 `--max-api-calls`，或單段文字超過 `--max-segment-chars`。
+- Fix: 先檢查 `.report.json`，縮短稿件、改 `--mode single`，或在使用者確認成本後加 `--force`。
 
 - Symptom: 沒有金鑰無法生成
 - Cause: 未設 `GEMINI_API_KEY`／`GOOGLE_API_KEY`。
@@ -295,6 +318,7 @@ Output:
 
 This skill includes:
 - `scripts/gemini_tts.py` — 唯一執行入口：Gemini TTS 合成 + 時長量測 + SRT 生成（含 `--estimate`／`--self-test`／`--list-voices`）。
+- `requirements.txt` — Python runtime dependency manifest（`google-genai>=2.9.0`；`faster-whisper` 與 ffmpeg 為 optional）。
 - `references/prompting.md` — **整合自 `tts-prompter` 的完整提示詞框架**（公式、風格／腳本分離、markup tags、30 個 voice、完整語速表）；本技能內建的權威來源。
 - `references/srt-strategy.md` — 為什麼 Gemini TTS 要用「逐句實測」對齊字幕，以及三種模式比較。
 - `references/readiness_report.md` — release evidence（機械 gate 結果）。
