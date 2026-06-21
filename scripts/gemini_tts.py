@@ -61,6 +61,7 @@ DEFAULT_MAX_SEGMENT_CHARS = 1000
 DEFAULT_CHUNK_CHAR_BUDGET = 6000
 DEFAULT_SINGLE_WARN_SECONDS = 180
 DEFAULT_RETRIES = 2
+_API_KEY_SELECTION_WARNED = False
 
 # The 30 prebuilt Gemini voices (name -> timbre). Canonical list in references/prompting.md.
 VOICES = {
@@ -181,7 +182,9 @@ def classify_api_error(err: BaseException) -> ApiErrorInfo:
     if status == 429:
         return ApiErrorInfo(
             "quota_or_rate_limit", status, False, raw,
-            "Wait before retrying, reduce segmented line count, or use --estimate first.",
+            "Wait for the retry-after window if one is provided. For segmented jobs, "
+            "stop issuing per-line calls and rerun with --mode single; if the 3.1 TTS "
+            f"model remains quota-limited or unavailable, retry once with --model {FALLBACK_MODEL}.",
         )
     if status in (500, 502, 503, 504):
         return ApiErrorInfo(
@@ -194,6 +197,35 @@ def classify_api_error(err: BaseException) -> ApiErrorInfo:
             "Use a clearer TTS preamble and explicitly separate director notes from transcript.",
         )
     return ApiErrorInfo("api_error", status, False, raw, "Check the request and model.")
+
+
+def resolve_api_key(api_key: str | None) -> str | None:
+    """Choose one API key deterministically and warn once when both env vars are set."""
+    global _API_KEY_SELECTION_WARNED
+    if api_key:
+        return api_key
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    google_key = os.environ.get("GOOGLE_API_KEY")
+    if gemini_key and google_key and not _API_KEY_SELECTION_WARNED:
+        sys.stderr.write(
+            "[warn] Both GEMINI_API_KEY and GOOGLE_API_KEY are set; using GEMINI_API_KEY. "
+            "Pass --api-key to override for this run.\n"
+        )
+        _API_KEY_SELECTION_WARNED = True
+    return gemini_key or google_key
+
+
+def rate_limit_recovery(mode: str, model: str, estimated_api_calls: int) -> dict[str, object] | None:
+    if mode != "segmented":
+        return None
+    recovery: dict[str, object] = {
+        "reason": "segmented mode spends one Gemini TTS request per subtitle line",
+        "estimated_api_calls": estimated_api_calls,
+        "rerun_flags": ["--mode", "single"],
+    }
+    if model != FALLBACK_MODEL:
+        recovery["rerun_flags"].extend(["--model", FALLBACK_MODEL])
+    return recovery
 
 
 # ---------------------------------------------------------------------------
@@ -476,7 +508,7 @@ def synthesize(text: str, voice: str, style: str, model: str,
         )
         raise GeminiTtsError(info) from e
 
-    key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    key = resolve_api_key(api_key)
     if not key:
         info = ApiErrorInfo(
             "missing_api_key", None, False,
@@ -960,6 +992,11 @@ def main(argv=None) -> int:
                 api_key=args.api_key or None, align=args.align, language=lang,
                 retries=args.retries)
     except GeminiTtsError as e:
+        recovery = (
+            rate_limit_recovery(args.mode, args.model, estimated_api_calls)
+            if e.info.category == "quota_or_rate_limit"
+            else None
+        )
         report = {
             "mode": args.mode,
             "model": args.model,
@@ -970,8 +1007,15 @@ def main(argv=None) -> int:
             "suggestion": e.info.suggestion,
             "report": str(report_path),
         }
+        if recovery:
+            report["fallback"] = recovery
         write_json(report_path, report)
         sys.stderr.write(f"[error] {e.info.category}: {e.info.message} {e.info.suggestion}\n")
+        if recovery:
+            sys.stderr.write(
+                "[hint] segmented fallback: rerun the same script with "
+                f"{' '.join(str(flag) for flag in recovery['rerun_flags'])}.\n"
+            )
         return 1
     except Exception as e:
         message = _scrub_error_message(str(e) or e.__class__.__name__)

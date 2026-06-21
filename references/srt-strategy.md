@@ -7,7 +7,7 @@ The Gemini TTS API returns **only audio** (24kHz/16-bit/mono PCM) and **no times
 
 ## Three approaches this skill supports
 
-### 1. segmented (default, recommended)
+### 1. segmented (most accurate; quota-sensitive)
 Synthesize each subtitle line as its **own** TTS call, then measure that line's exact
 duration directly from the PCM byte count:
 
@@ -21,6 +21,9 @@ timeline is the running sum of measured durations.
 - Pros: exact timing, subtitle text is the original script (zero ASR error), no ffprobe,
   no model download.
 - Cons: one API call per line (more quota); prosody resets at each line boundary.
+- Use when `estimated_api_calls` is low or the account has confirmed request quota.
+  For free-tier or unknown quota, treat more than three calls as a signal to consider
+  `--mode single` first.
 
 ### 2. single
 One TTS call for the whole script (smoother prosody). Per-line timing is then either:
@@ -72,5 +75,10 @@ constraint instead of relying only on punctuation heuristics.
   subtitle text, positive PCM duration, and parseable audio output.
 - Segmented synthesis is blocked when line count exceeds `--max-api-calls` unless
   `--force` is supplied.
+- 429 / `RESOURCE_EXHAUSTED` in segmented mode should stop per-line retries and fall
+  back to `--mode single`; if the default 3.1 model remains unavailable or limited,
+  retry once with `gemini-2.5-flash-preview-tts`.
+- If both `GEMINI_API_KEY` and `GOOGLE_API_KEY` are set, the CLI warns once and uses
+  `GEMINI_API_KEY`; use `--api-key` to override per run.
 - `--format mp3` falls back to WAV by default if ffmpeg fails; `--strict-format` turns
   that into a non-zero exit for automated pipelines.
