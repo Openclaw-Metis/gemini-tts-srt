@@ -14,6 +14,12 @@ server errors are retried, unknown voices fail fast, outputs are validated, repo
 are always written, output paths are absolute, and long segmented jobs are preflighted
 before paid synthesis.
 
+The 2026-06-21 incident-driven revision adds quota-aware mode selection guidance:
+segmented mode is no longer treated as a safe default for long or free-tier jobs. When
+`estimated_api_calls` is high or quota is unknown, the workflow now prefers `--mode
+single`; segmented 429 / `RESOURCE_EXHAUSTED` reports include a fallback hint to stop
+per-line retries and rerun single-mode, optionally with the 2.5 TTS fallback model.
+
 ## Current Gemini evidence
 
 Source checked: Google AI for Developers, "Text-to-speech generation (TTS)",
@@ -40,6 +46,8 @@ last updated 2026-06-18 UTC.
 | Absolute paths | `--out-dir` is resolved; report JSON contains absolute `audio`, `srt`, and `report` paths. |
 | Report file | Estimate, dry-run, success, long-job blocked, API failure, conversion failure, and validation failure paths write `<basename>.report.json`; argparse/input-shape errors may stop before artifact paths are meaningful. |
 | Cost preflight | `--max-api-calls` blocks large segmented synthesis unless `--force` is supplied; `--dry-run-cost` reports estimated calls/chunks without API usage. |
+| Rate-limit recovery | 429 / `RESOURCE_EXHAUSTED` returns `quota_or_rate_limit`; segmented failures add `fallback.rerun_flags` for `--mode single` and, when appropriate, `--model gemini-2.5-flash-preview-tts`. |
+| API key precedence | When both `GEMINI_API_KEY` and `GOOGLE_API_KEY` are set, the CLI warns once and uses `GEMINI_API_KEY`; `--api-key` remains the per-run override. |
 | Format contract | `--strict-format` turns MP3 fallback into a non-zero exit for pipelines. |
 | Path safety | `--basename` is sanitized and outputs are constrained to `--out-dir`. |
 | Protected terms | `--protect-terms` / `--protect-file` prevent critical terms from being split by the line wrapper. |
@@ -47,12 +55,15 @@ last updated 2026-06-18 UTC.
 
 ## Local verification
 
-Run from `C:\Users\Oberon\.claude\skills\gemini-tts-srt`.
+Run from `C:\Users\Oberon\.codex\skills\gemini-tts-srt`.
 
 | Check | Result |
 |---|---|
 | `python -m py_compile scripts/gemini_tts.py` | PASS |
 | `python scripts/gemini_tts.py --self-test` | PASS (`RESULT: ALL PASS`) |
+| `python -m json.tool assets/evals/evals.json` | PASS |
+| dual-key precedence smoke | PASS; chose `GEMINI_API_KEY` and warned once |
+| 429 fallback hint smoke | PASS; classified `quota_or_rate_limit` and produced single-mode rerun flags |
 | estimate with sanitized `--basename '..\bad/name'` | PASS; output paths stayed under `--out-dir` and were absolute |
 | invalid voice smoke | PASS; command returned non-zero before API use |
 | long segmented preflight smoke | PASS; command returned blocked report before API use |
@@ -69,7 +80,7 @@ paid calls.
 ## Mechanical gate evidence
 
 Run from `C:\Users\Oberon\.codex\project` against target
-`C:\Users\Oberon\.claude\skills\gemini-tts-srt`.
+`C:\Users\Oberon\.codex\skills\gemini-tts-srt`.
 
 | Gate | Result |
 |---|---|

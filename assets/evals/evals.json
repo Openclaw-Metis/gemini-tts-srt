@@ -234,6 +234,69 @@
         "retry 次數受 --retries 限制",
         "最終失敗時 report 包含 error/status/suggestion 且不輸出成功檔案清單"
       ]
+    },
+    {
+      "id": 13,
+      "name": "zh-rate-limit-aware-mode-selection",
+      "type": "functional",
+      "language": "zh",
+      "trigger_class": "direct",
+      "coverage_tags": [
+        "edge-case",
+        "quota",
+        "should-trigger"
+      ],
+      "prompt": "這段 21 行的 zh-TW 短影音旁白要用 Gemini 女聲配音並產 SRT；目前只知道可能是 free-tier，配額不確定。",
+      "expected_output": "先用 --estimate / --dry-run-cost 檢查 estimated_api_calls；若超過 3 且配額未知，不直接跑 21 次 segmented request，改用 --mode single 或先取得使用者確認。",
+      "files": [],
+      "expectations": [
+        "讀取 report 的 estimated_api_calls",
+        "辨識 segmented 會一行一個 request",
+        "配額未知時優先採用 --mode single",
+        "若仍要 segmented，先明確告知呼叫次數與配額風險"
+      ]
+    },
+    {
+      "id": 14,
+      "name": "segmented-429-resource-exhausted-recovery",
+      "type": "functional",
+      "language": "mixed",
+      "trigger_class": "direct",
+      "coverage_tags": [
+        "failure-mode",
+        "quota",
+        "should-trigger"
+      ],
+      "prompt": "Gemini TTS segmented mode returns 429 RESOURCE_EXHAUSTED after several lines. What should the skill do next?",
+      "expected_output": "停止同一批 segmented 重試，回報 quota_or_rate_limit；等 retry-after 後改用 --mode single，必要時加 --model gemini-2.5-flash-preview-tts。",
+      "files": [],
+      "expectations": [
+        "不繼續逐行消耗 request quota",
+        "失敗 report 包含 quota_or_rate_limit",
+        "fallback 指向 --mode single",
+        "若 3.1 模型仍受限，建議 2.5 TTS fallback"
+      ]
+    },
+    {
+      "id": 15,
+      "name": "dual-api-key-warning-once",
+      "type": "functional",
+      "language": "en",
+      "trigger_class": "direct",
+      "coverage_tags": [
+        "edge-case",
+        "auth",
+        "should-trigger"
+      ],
+      "prompt": "Both GEMINI_API_KEY and GOOGLE_API_KEY are set while running a segmented Gemini TTS job.",
+      "expected_output": "CLI chooses GEMINI_API_KEY deterministically, warns once only, and tells the user to pass --api-key to override.",
+      "files": [],
+      "expectations": [
+        "key precedence is deterministic",
+        "warning is not repeated for every segment",
+        "secrets are never printed",
+        "--api-key is documented as the per-run override"
+      ]
     }
   ]
 }
